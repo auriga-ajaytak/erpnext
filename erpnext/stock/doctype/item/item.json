@@ -11,11 +11,11 @@
  "editable_grid": 1,
  "engine": "InnoDB",
  "field_order": [
-    "item_name",
   "name_and_description_section",
   "naming_series",
   "item_code",
   "variant_of",
+  "item_name",
   "item_group",
   "is_item_from_hub",
   "stock_uom",
