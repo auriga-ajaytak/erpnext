@@ -856,15 +856,22 @@ class StockEntry(StockController):
 							se_item.item_code, self.purchase_order
 						)
 					)
-				total_supplied = frappe.db.sql(
-					"""select sum(transfer_qty)
-					from `tabStock Entry Detail`, `tabStock Entry`
-					where `tabStock Entry`.purchase_order = %s
-						and `tabStock Entry`.docstatus = 1
-						and `tabStock Entry Detail`.item_code = %s
-						and `tabStock Entry Detail`.parent = `tabStock Entry`.name""",
-					(self.purchase_order, se_item.item_code),
-				)[0][0]
+
+				se = frappe.qb.DocType("Stock Entry")
+				se_detail = frappe.qb.DocType("Stock Entry Detail")
+
+				total_supplied = (
+					frappe.qb.from_(se)
+					.inner_join(se_detail)
+					.on(se.name == se_detail.parent)
+					.select(Sum(se_detail.transfer_qty))
+					.where(
+						(se.purpose == "Send to Subcontractor")
+						& (se.purchase_order == self.purchase_order)
+						& (se_detail.item_code == se_item.item_code)
+						& (se.docstatus == 1)
+					)
+				).run()[0][0]
 
 				if flt(total_supplied, precision) > flt(total_allowed, precision):
 					frappe.throw(
@@ -872,6 +879,27 @@ class StockEntry(StockController):
 							se_item.idx, se_item.item_code, total_allowed, self.purchase_order
 						)
 					)
+				elif not se_item.get("po_detail"):
+					filters = {
+						"parent": self.purchase_order,
+						"docstatus": 1,
+						"rm_item_code": se_item.item_code,
+						"main_item_code": se_item.subcontracted_item,
+					}
+
+					order_rm_detail = frappe.db.get_value("Purchase Order Item Supplied", filters, "name")
+					if order_rm_detail:
+						se_item.db_set("po_detail", order_rm_detail)
+					else:
+						if not se_item.allow_alternative_item:
+							frappe.throw(
+								_("Row {0}# Item {1} not found in 'Raw Materials Supplied' table in {2} {3}").format(
+									se_item.idx,
+									se_item.item_code,
+									"Purchase Order",
+									self.purchase_order,
+								)
+							)
 		elif backflush_raw_materials_based_on == "Material Transferred for Subcontract":
 			for row in self.items:
 				if not row.subcontracted_item:
@@ -987,8 +1015,8 @@ class StockEntry(StockController):
 			# No work order could mean independent Manufacture entry, if so skip validation
 			if self.work_order and self.fg_completed_qty > allowed_qty:
 				frappe.throw(
-					_("For quantity {0} should not be greater than work order quantity {1}").format(
-						flt(self.fg_completed_qty), wo_qty
+					_("For quantity {0} should not be greater than allowed quantity {1}").format(
+						flt(self.fg_completed_qty), allowed_qty
 					)
 				)
 
@@ -1446,6 +1474,7 @@ class StockEntry(StockController):
 			"reference_name": self.pro_doc.name,
 			"reference_doctype": self.pro_doc.doctype,
 			"qty_to_produce": (">", 0),
+			"batch_qty": ("=", 0),
 		}
 
 		fields = ["qty_to_produce as qty", "produced_qty", "name"]
@@ -2163,16 +2192,16 @@ class StockEntry(StockController):
 			d.qty -= process_loss_dict[d.item_code][1]
 
 	def set_serial_no_batch_for_finished_good(self):
-		args = {}
+		serial_nos = []
 		if self.pro_doc.serial_no:
-			self.get_serial_nos_for_fg(args)
+			serial_nos = self.get_serial_nos_for_fg() or []
 
 		for row in self.items:
 			if row.is_finished_item and row.item_code == self.pro_doc.production_item:
-				if args.get("serial_no"):
-					row.serial_no = "\n".join(args["serial_no"][0 : cint(row.qty)])
+				if serial_nos:
+					row.serial_no = "\n".join(serial_nos[0 : cint(row.qty)])
 
-	def get_serial_nos_for_fg(self, args):
+	def get_serial_nos_for_fg(self):
 		fields = [
 			"`tabStock Entry`.`name`",
 			"`tabStock Entry Detail`.`qty`",
@@ -2183,14 +2212,12 @@ class StockEntry(StockController):
 		filters = [
 			["Stock Entry", "work_order", "=", self.work_order],
 			["Stock Entry", "purpose", "=", "Manufacture"],
-			["Stock Entry", "docstatus", "=", 1],
+			["Stock Entry", "docstatus", "<", 2],
 			["Stock Entry Detail", "item_code", "=", self.pro_doc.production_item],
 		]
 
 		stock_entries = frappe.get_all("Stock Entry", fields=fields, filters=filters)
-
-		if self.pro_doc.serial_no:
-			args["serial_no"] = self.get_available_serial_nos(stock_entries)
+		return self.get_available_serial_nos(stock_entries)
 
 	def get_available_serial_nos(self, stock_entries):
 		used_serial_nos = []

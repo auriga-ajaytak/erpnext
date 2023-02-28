@@ -152,6 +152,7 @@ class AccountsController(TransactionBase):
 		self.validate_inter_company_reference()
 
 		self.disable_pricing_rule_on_internal_transfer()
+		self.disable_tax_included_prices_for_internal_transfer()
 		self.set_incoming_rate()
 
 		if self.meta.get_field("currency"):
@@ -382,7 +383,7 @@ class AccountsController(TransactionBase):
 				self.get("inter_company_reference")
 				or self.get("inter_company_invoice_reference")
 				or self.get("inter_company_order_reference")
-			):
+			) and not self.get("is_return"):
 				msg = _("Internal Sale or Delivery Reference missing.")
 				msg += _("Please create purchase from internal sale or delivery document itself")
 				frappe.throw(msg, title=_("Internal Sales Reference Missing"))
@@ -394,6 +395,20 @@ class AccountsController(TransactionBase):
 				_("Disabled pricing rules since this {} is an internal transfer").format(self.doctype),
 				alert=1,
 			)
+
+	def disable_tax_included_prices_for_internal_transfer(self):
+		if self.is_internal_transfer():
+			tax_updated = False
+			for tax in self.get("taxes"):
+				if tax.get("included_in_print_rate"):
+					tax.included_in_print_rate = 0
+					tax_updated = True
+
+			if tax_updated:
+				frappe.msgprint(
+					_("Disabled tax included prices since this {} is an internal transfer").format(self.doctype),
+					alert=1,
+				)
 
 	def validate_due_date(self):
 		if self.get("is_pos"):
@@ -558,7 +573,12 @@ class AccountsController(TransactionBase):
 					if bool(uom) != bool(stock_uom):  # xor
 						item.stock_uom = item.uom = uom or stock_uom
 
-					item.conversion_factor = get_uom_conv_factor(item.get("uom"), item.get("stock_uom"))
+					# UOM cannot be zero so substitute as 1
+					item.conversion_factor = (
+						get_uom_conv_factor(item.get("uom"), item.get("stock_uom"))
+						or item.get("conversion_factor")
+						or 1
+					)
 
 			if self.doctype == "Purchase Invoice":
 				self.set_expense_account(for_validate)
@@ -1105,17 +1125,17 @@ class AccountsController(TransactionBase):
 			frappe.db.get_single_value("Accounts Settings", "enable_discount_accounting")
 		)
 
+		if self.doctype == "Purchase Invoice":
+			dr_or_cr = "credit"
+			rev_dr_cr = "debit"
+			supplier_or_customer = self.supplier
+
+		else:
+			dr_or_cr = "debit"
+			rev_dr_cr = "credit"
+			supplier_or_customer = self.customer
+
 		if enable_discount_accounting:
-			if self.doctype == "Purchase Invoice":
-				dr_or_cr = "credit"
-				rev_dr_cr = "debit"
-				supplier_or_customer = self.supplier
-
-			else:
-				dr_or_cr = "debit"
-				rev_dr_cr = "credit"
-				supplier_or_customer = self.customer
-
 			for item in self.get("items"):
 				if item.get("discount_amount") and item.get("discount_account"):
 					discount_amount = item.discount_amount * item.qty
@@ -1169,18 +1189,22 @@ class AccountsController(TransactionBase):
 						)
 					)
 
-			if self.get("discount_amount") and self.get("additional_discount_account"):
-				gl_entries.append(
-					self.get_gl_dict(
-						{
-							"account": self.additional_discount_account,
-							"against": supplier_or_customer,
-							dr_or_cr: self.discount_amount,
-							"cost_center": self.cost_center,
-						},
-						item=self,
-					)
+		if (
+			(enable_discount_accounting or self.get("is_cash_or_non_trade_discount"))
+			and self.get("additional_discount_account")
+			and self.get("discount_amount")
+		):
+			gl_entries.append(
+				self.get_gl_dict(
+					{
+						"account": self.additional_discount_account,
+						"against": supplier_or_customer,
+						dr_or_cr: self.discount_amount,
+						"cost_center": self.cost_center,
+					},
+					item=self,
 				)
+			)
 
 	def validate_multiple_billing(self, ref_dt, item_ref_dn, based_on, parentfield):
 		from erpnext.controllers.status_updater import get_allowance_for
